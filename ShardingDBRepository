@@ -1,0 +1,421 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Data;
+using System.Linq;
+using System.Linq.Expressions;
+using System.Reflection;
+using System.Threading.Tasks;
+using Dapper;
+using Domain.Abstraction.Attribute;
+using Domain.Abstraction.EFMySql;
+using Infrastructure.Data.Exception;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
+using MySqlConnector;
+
+namespace Infrastructure.Data.EFMySql
+{
+    /// <summary>
+    /// 分库分表
+    /// </summary>
+    /// <typeparam name="TEntity"></typeparam>
+    /// <typeparam name="TDbContext"></typeparam>
+    /// <typeparam name="TConnOptions"></typeparam>
+    public class ShardingDBRepository<TModule, TDbContext, TConnOptions> : IShardingDBRepository<TModule>, IDisposable
+        where TDbContext : AbstractShardDbContext
+        where TModule : AbstractShardingModule
+        where TConnOptions : ShardDBConnectionOptions
+    {
+        private readonly IOptions<TConnOptions> _options;
+        private AbstractShardDbContext _context;
+        private object _locker = new object();
+        private ConcurrentDictionary<string, string> _mapShardKey;
+        private long first_db_key = int.MinValue;
+        private long first_mod_key = int.MinValue;
+        private readonly IServiceProvider sp;
+
+        public ShardingDBRepository(IOptions<TConnOptions> options, IServiceProvider sp)
+        {
+            this._options = options;
+            this.sp = sp;
+            if (_mapShardKey == null)
+            {
+                lock (_locker)
+                {
+                    if (_mapShardKey == null)
+                    {
+                        _mapShardKey = new ConcurrentDictionary<string, string>();
+                    }
+                }
+            }
+        }
+
+        #region 接口方法
+
+        public async Task<TEntity> ReadSingleAsync<TEntity>(Expression<Func<TEntity, bool>> query, ShardingKey shardingKey) where TEntity : AbstractShardingEntity
+        {
+            this.InitDbContext(shardingKey.Key);
+            return await this._context.Set<TEntity>().AsNoTracking().FirstOrDefaultAsync(query).ConfigureAwait(false);
+        }
+
+        public async Task<TResult> MaxAsync<TEntity, TResult>(Expression<Func<TEntity, bool>> query, Expression<Func<TEntity, TResult>> maxField, ShardingKey shardingKey)
+            where TEntity : AbstractShardingEntity
+        {
+            this.InitDbContext(shardingKey.Key);
+            return await this._context.Set<TEntity>().AsNoTracking().Where(query).MaxAsync(maxField).ConfigureAwait(false);
+        }
+
+        public async Task<long> CountAsync<TEntity>(Expression<Func<TEntity, bool>> query, ShardingKey shardingKey) where TEntity : AbstractShardingEntity
+        {
+            this.InitDbContext(shardingKey.Key);
+            return await this._context.Set<TEntity>().AsNoTracking().LongCountAsync(query).ConfigureAwait(false);
+        }
+
+        public async Task<TEntity> ReadSingleAsync<TEntity, TOrder>(Expression<Func<TEntity, bool>> query,
+                                                                    Expression<Func<TEntity, TOrder>> order,
+                                                                    ShardingKey shardingKey,
+                                                                    bool isAsc = true) where TEntity : AbstractShardingEntity
+        {
+            this.InitDbContext(shardingKey.Key);
+            if (isAsc)
+            {
+                return await this._context.Set<TEntity>().AsNoTracking().Where(query).OrderBy(order).Skip(0).Take(1).FirstOrDefaultAsync().ConfigureAwait(false);
+            }
+            else
+            {
+                return await this._context.Set<TEntity>().AsNoTracking().Where(query).OrderByDescending(order).Skip(0).Take(1).FirstOrDefaultAsync().ConfigureAwait(false);
+            }
+        }
+
+        public async Task<List<TEntity>> ReadManyAsync<TEntity>(Expression<Func<TEntity, bool>> query, ShardingKey shardingKey) where TEntity : AbstractShardingEntity
+        {
+            InitDbContextAfterVerify(shardingKey);
+            return await this._context.Set<TEntity>().Where(query).AsNoTracking().ToListAsync().ConfigureAwait(false);
+        }
+
+        public async Task<List<TEntity>> ReadManyAsync<TEntity, TOrder>(Expression<Func<TEntity, bool>> query,
+                                                                        Expression<Func<TEntity, TOrder>> order,
+                                                                        ShardingKey shardingKey,
+                                                                        bool isAsc = true) where TEntity : AbstractShardingEntity
+        {
+            InitDbContextAfterVerify(shardingKey);
+
+            if (isAsc)
+            {
+                return await this._context.Set<TEntity>().AsNoTracking().Where(query).OrderBy(order).ToListAsync().ConfigureAwait(false);
+            }
+            else
+            {
+                return await this._context.Set<TEntity>().AsNoTracking().Where(query).OrderByDescending(order).ToListAsync().ConfigureAwait(false);
+            }
+        }
+
+        public async Task<List<TEntity>> ReadManyAsync<TEntity>(Expression<Func<TEntity, bool>> query, int skip, int take, ShardingKey shardingKey)
+            where TEntity : AbstractShardingEntity
+        {
+            InitDbContextAfterVerify(shardingKey);
+
+            return await this._context.Set<TEntity>().AsNoTracking().Where(query).Skip(skip).Take(take).ToListAsync().ConfigureAwait(false);
+        }
+
+        public async Task<List<TMap>> ReadManyWithMappingAsync<TEntity, TMap>(Expression<Func<TEntity, bool>> query,
+                                                                              Expression<Func<TEntity, TMap>> selector,
+                                                                              ShardingKey shardingKey) where TEntity : AbstractShardingEntity
+        {
+            InitDbContextAfterVerify(shardingKey);
+
+            return await this._context.Set<TEntity>().AsNoTracking().Where(query).Select(selector).ToListAsync().ConfigureAwait(false);
+        }
+
+        public async Task<List<TMap>> ReadManyWithMappingAsync<TEntity, TMap>(Expression<Func<TEntity, bool>> query,
+                                                                              Expression<Func<TEntity, TMap>> selector,
+                                                                              int skip,
+                                                                              int take,
+                                                                              ShardingKey shardingKey) where TEntity : AbstractShardingEntity
+        {
+            InitDbContextAfterVerify(shardingKey);
+
+            return await this._context.Set<TEntity>().AsNoTracking().Where(query).Select(selector).Skip(skip).Take(take).ToListAsync().ConfigureAwait(false);
+        }
+
+        public async Task<List<TResult>> ReadSqlAsync<TResult>(string sql, object parameter, ShardingKey shardingKey, int timeout = 60)
+        {
+            //this.InitDbContext(shardingKey.Key);
+            using (var connection = new MySqlConnection(this.SelectDbConnection(shardingKey.Key)))
+            {
+                try
+                {
+                    var datas = await connection.QueryAsync<TResult>(this.replaceTableIndex(sql), parameter, null, timeout).ConfigureAwait(false);
+                    return datas?.ToList();
+                }
+                catch (System.Exception e)
+                {
+                    throw new RepositoryException(e.Message);
+                }
+            }
+        }
+
+        public async Task<long> CountSqlAsync(string sql, object parameter, ShardingKey shardingKey, int timeout = 60)
+        {
+            this.InitDbContext(shardingKey.Key);
+            using (var connection = new MySqlConnection(this._context.Conn))
+            {
+                var count = await connection.QuerySingleAsync<long>(this.replaceTableIndex(sql), parameter, null, timeout).ConfigureAwait(false);
+                return count;
+            }
+        }
+
+        public async Task<DataTable> ReadSql2DTAsync(string sql, object parameter, ShardingKey shardingKey, int timeout = 60)
+        {
+            this.InitDbContext(shardingKey.Key);
+            DataTable dt = new DataTable();
+            using (var conn = new MySqlConnection(this._context.Conn))
+            {
+                using (var reader = await conn.ExecuteReaderAsync(this.replaceTableIndex(sql), parameter, null, timeout).ConfigureAwait(false))
+                {
+                    dt.Load(reader);
+                }
+            }
+
+            return dt;
+        }
+
+        public async Task CreateSingleAsync<TEntity>(TEntity entity) where TEntity : AbstractShardingEntity
+        {
+            if (entity == null) throw new RepositoryException($"{nameof(entity)} is null");
+
+            var key = entity.GetType().GetProperty(this.getShardKey<TEntity>())?.GetValue(entity, null);
+            this.InitDbContext(key);
+            await this._context.Set<TEntity>().AddAsync(entity).ConfigureAwait(false);
+        }
+
+        public void Update<TEntity>(TEntity update) where TEntity : AbstractShardingEntity
+        {
+            if (update.id <= 0)
+                throw new RepositoryException($"the id[{update.id}] in the entity need updated should > 0");
+
+            var key = update.GetType().GetProperty(this.getShardKey<TEntity>())?.GetValue(update, null);
+            this.InitDbContext(key);
+
+            var local = this._context.Set<TEntity>().Local.FirstOrDefault(x => Equals(x.id, update.id));
+            if (local != null)
+                this._context.Entry(local).State = EntityState.Detached;
+
+            this._context.Entry(update).State = EntityState.Modified;
+        }
+
+        public void UpdateMany<TEntity>(IEnumerable<TEntity> updates, ShardingKey shardingKey) where TEntity : AbstractShardingEntity
+        {
+            InitDbContextAfterVerify(shardingKey);
+            if (updates == null) throw new RepositoryException($"{nameof(updates)} is null");
+            if (!updates.Any()) throw new RepositoryException($"{nameof(updates)} is empty");
+
+            //if (shardingKey.Keys == null || shardingKey.Keys.Count() != updates.Count())
+            //{
+            //    throw new RepositoryException("num of shardingkey is not equal");
+            //}
+            this._context.Set<TEntity>().UpdateRange(updates);
+        }
+
+        public void Delete<TEntity>(TEntity update) where TEntity : AbstractShardingEntity
+        {
+            if (update.id <= 0)
+                throw new RepositoryException($"the id[{update.id}] in the entity need updated should > 0");
+
+            var key = update.GetType().GetProperty(this.getShardKey<TEntity>())?.GetValue(update, null);
+            this.InitDbContext(key);
+
+            update.is_deleted = true;
+            var local = this._context.Set<TEntity>().Local.FirstOrDefault(x => Equals(x.id, update.id));
+            if (local != null)
+                this._context.Entry(local).State = EntityState.Detached;
+
+            this._context.Entry(update).State = EntityState.Modified;
+        }
+
+        public async Task<int> ExecuteAsync(string sql, ShardingKey shardingKey, object param = null)
+        {
+            using (var connection = new MySqlConnection(this.SelectDbConnection(shardingKey.Key)))
+            {
+                try
+                {
+                    return await connection.ExecuteAsync(this.replaceTableIndex(sql), param).ConfigureAwait(false);
+                }
+                catch (System.Exception e)
+                {
+                    throw new RepositoryException(e.Message);
+                }
+            }
+        }
+
+        #endregion
+
+        public async Task<bool> SaveChangeAsync()
+        {
+            if (this._context != null)
+            {
+                return await this._context.SaveChangesAsync() > 0;
+            }
+            else
+            {
+                throw new RepositoryException($"{nameof(TDbContext)} 上下文为空，无法进行保存，此异常请查明原因");
+            }
+        }
+
+        private void InitDbContextAfterVerify(ShardingKey shardingKey)
+        {
+            //if (shardingKey.Keys == null || !shardingKey.Keys.Any()) throw new RepositoryException("sharding keys is null");
+            //var firstMod = this.mod(shardingKey.Keys.FirstOrDefault().Key);
+            //if (shardingKey.IsPartialTable)
+            //{
+            //    for (int i = 1; i < shardingKey.Keys.Count(); i++)
+            //    {
+            //        var curMod = this.mod(shardingKey.Keys.ElementAt(i).Key);
+            //        if (curMod != firstMod)
+            //        {
+            //            throw new RepositoryException("keys in sharding are not the same");
+            //        }
+            //    }
+            //}
+            var firstMod = this.mod(shardingKey.Key);
+
+            this.InitDbContext(firstMod);
+        }
+
+        private string SelectDbConnection(long key)
+        {
+            var conns = this._options.Value.Conns;
+            var dbMode = key % conns.Count;
+            var keyMode = this.mod(key);
+            if (this.first_mod_key >= 0 && keyMode != this.first_mod_key || this.first_db_key >= 0 && dbMode != this.first_db_key)
+            {
+                throw new
+                    RepositoryException($"当前repository中的context实例，已经和keyMode({this.first_mod_key})/dbMode({this.first_db_key})绑定，无法和keyMode({keyMode})/dbMode({dbMode})绑定，可能您的业务涉及到多个modkey，可以考虑使用IScopeService进行隔离");
+            }
+            else
+            {
+                this.first_mod_key = keyMode;
+                this.first_db_key = dbMode;
+            }
+            return this._options.Value.Conns[Convert.ToInt32(dbMode)];
+        }
+
+        private void InitDbContext(object shardFieldValue)
+        {
+            //类初始化之后，再创建，而非ctor的时候就创建
+            if (this._context == null)
+            {
+                lock (_locker)
+                {
+                    if (this._context == null)
+                    {
+                        try
+                        {
+                            long key = -1;
+                            if (shardFieldValue != null)
+                            {
+                                key = Convert.ToInt64(shardFieldValue);
+                            }
+
+                            //this._options.Value.Conns.Sort();
+                            var conns = this._options.Value.Conns;
+                            var dbMode = key % conns.Count;
+                            var keyMode = this.mod(key);
+                            if (this.first_mod_key >= 0 && keyMode != this.first_mod_key || this.first_db_key >= 0 && dbMode != this.first_db_key)
+                            {
+                                throw new
+                                    RepositoryException($"当前repository中的context实例，已经和keyMode({this.first_mod_key})/dbMode({this.first_db_key})绑定，无法和keyMode({keyMode})/dbMode({dbMode})绑定，可能您的业务涉及到多个modkey，可以考虑使用IScopeService进行隔离");
+                            }
+                            else
+                            {
+                                first_mod_key = keyMode;
+                                this.first_db_key = dbMode;
+                            }
+
+                            this._context = ActivatorUtilities.CreateInstance<TDbContext>(this.sp, conns.ElementAt(Convert.ToInt32(dbMode)), keyMode);
+                            //var context = Activator.CreateInstance(typeof(TDbContext), conns.ElementAt(Convert.ToInt32(dbMode)), keyMode);
+                            //this._context = context as TDbContext;
+                            //this._context = CreateDbContext(conns.ElementAt(Convert.ToInt32(dbMode)), keyMode);
+                        }
+                        catch (System.Exception e)
+                        {
+                            throw new RepositoryException($"初始化上下文出错，shardFieldValue为：{shardFieldValue}，错误信息为：{e.Message}");
+                        }
+                    }
+                }
+            }
+        }
+
+        //protected virtual AbstractShardDbContext CreateDbContext(string connectionString, long partialKey)
+        //{
+        //    var context = Activator.CreateInstance(typeof(TDbContext), connectionString, partialKey);
+        //    return context as TDbContext;
+        //}
+
+        private long mod(long key)
+        {
+            return key % this._options.Value.ShardNum;
+        }
+
+        private string getShardKey<TEntity>()
+            where TEntity : AbstractShardingEntity
+        {
+            var _shardKeyName = string.Empty;
+            var typeFullName = typeof(TEntity).FullName;
+            if (_mapShardKey.ContainsKey(typeFullName))
+            {
+                return _mapShardKey[typeFullName];
+            }
+
+            /*
+             * di容器初始化容器的时候，就解析下TEntity对象，有没有有且只有一个打上特性SupportSharding的属性，有的话，就把这个属性的name存下来
+             * 因为是scope生命周期，而且是容器创建，所以完全可以放心的在ctor中去做这个事情
+             */
+            var properties = typeof(TEntity).GetProperties();
+            foreach (var p in properties)
+            {
+                if (p.GetCustomAttribute(typeof(SupportShardingAttribute)) == null)
+                {
+                    continue;
+                }
+                else
+                {
+                    _shardKeyName = p.Name;
+                    if (_mapShardKey.ContainsKey(typeFullName) == false)
+                    {
+                        var res = _mapShardKey.TryAdd(typeFullName, _shardKeyName);
+                        if (!res)
+                        {
+                            throw new RepositoryException("sharding key analyze error");
+                        }
+                    }
+                }
+            }
+
+            return _shardKeyName;
+        }
+
+        /// <summary>
+        /// 替换sql语句中的 @index 占位符
+        /// </summary>
+        /// <param name="rawSql"></param>
+        /// <returns></returns>
+        private string replaceTableIndex(string rawSql)
+        {
+            if (!rawSql.Contains("@index"))
+            {
+                throw new RepositoryException("因为该仓储是用来处理分库分表的对象，所以sql语句中的表名应该类似于 user_order_@index_info， 系统未找到@index，请校验！");
+            }
+
+            return rawSql.Replace("@index", this.first_mod_key.ToString("00"));
+        }
+
+        public void Dispose()
+        {
+            this._context?.Dispose();
+            this._context = null;
+        }
+    }
+}
